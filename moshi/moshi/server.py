@@ -557,11 +557,18 @@ def main():
             from accelerate import infer_auto_device_map, dispatch_model
             # Load LM on CPU first, then distribute
             lm = loaders.get_moshi_lm(args.moshi_weight, device="cpu", cpu_offload=False)
-            # Create device map for GPUs 2 and 3 (assuming 4 GPUs)
+            # Create device map for all available GPUs
             available_gpus = get_available_gpus()
             if len(available_gpus) >= 4:
-                # Create max_memory dict for GPUs 2 and 3
-                max_memory = {2: "14GiB", 3: "14GiB"}  # Tesla T4 has ~14GB
+                # Tesla T4 has ~16GB total VRAM
+                # Reserve ~1-2GB for mimi/other_mimi on GPUs 0-1, use rest for LM
+                # Use higher limits to utilize more VRAM - accelerate will be conservative by default
+                max_memory = {
+                    0: "15GiB",  # Reserve ~1GB for mimi
+                    1: "15GiB",  # Reserve ~1GB for other_mimi  
+                    2: "16GiB",  # Use nearly all VRAM for LM
+                    3: "16GiB",  # Use nearly all VRAM for LM
+                }
                 device_map = infer_auto_device_map(
                     lm,
                     max_memory=max_memory,
@@ -569,10 +576,14 @@ def main():
                     dtype=torch.bfloat16,
                 )
                 lm = dispatch_model(lm, device_map=device_map)
-                logger.info(f"LM model distributed across GPUs 2-3 using device_map")
-                # For dispatched models, use the first GPU in device_map as the primary device
-                # This is needed for LMGen initialization
-                lm_device = available_gpus[2]  # Keep as primary device for tensor operations
+                # Log memory allocation per GPU after distribution
+                for i in range(len(available_gpus)):
+                    torch.cuda.set_device(i)
+                    allocated_gb = torch.cuda.memory_allocated(i) / (1024**3)
+                    logger.info(f"GPU {i} memory allocated: {allocated_gb:.2f} GB")
+                logger.info(f"LM model distributed across {len(available_gpus)} GPUs using device_map")
+                # For dispatched models, use GPU 2 as primary device (first GPU dedicated to LM)
+                lm_device = available_gpus[2]
             else:
                 lm = lm.to(lm_device)
         except ImportError:
