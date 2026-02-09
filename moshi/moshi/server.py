@@ -65,6 +65,42 @@ def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     return torch.device("cpu")
 
 
+def get_available_gpus() -> list[torch.device]:
+    """Return list of available CUDA devices."""
+    if not torch.cuda.is_available():
+        return []
+    return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+
+
+def distribute_models_across_gpus(num_gpus: int) -> dict[str, torch.device]:
+    """
+    Distribute models across available GPUs.
+    
+    Strategy:
+    - mimi -> GPU 0
+    - other_mimi -> GPU 1
+    - lm -> Split across remaining GPUs (2, 3, ...) or GPU 0 if only 1 GPU
+    
+    Returns dict mapping model names to devices.
+    """
+    gpus = get_available_gpus()
+    if num_gpus == 0 or len(gpus) == 0:
+        return {"mimi": torch.device("cpu"), "other_mimi": torch.device("cpu"), "lm": torch.device("cpu")}
+    
+    if len(gpus) == 1:
+        # Single GPU: all models on GPU 0
+        return {"mimi": gpus[0], "other_mimi": gpus[0], "lm": gpus[0]}
+    elif len(gpus) == 2:
+        # Two GPUs: mimi on 0, other_mimi and lm on 1
+        return {"mimi": gpus[0], "other_mimi": gpus[1], "lm": gpus[1]}
+    elif len(gpus) >= 3:
+        # Three or more GPUs: mimi on 0, other_mimi on 1, lm split across 2+
+        return {"mimi": gpus[0], "other_mimi": gpus[1], "lm": gpus[2]}
+    else:
+        # Fallback: all on GPU 0
+        return {"mimi": gpus[0], "other_mimi": gpus[0], "lm": gpus[0]}
+
+
 def seed_all(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -96,17 +132,22 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, mimi_device: torch.device | None = None,
+                 other_mimi_device: torch.device | None = None, lm_device: torch.device | None = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
-        self.device = device
+        self.device = device  # Keep for backward compatibility, but prefer specific device attributes
+        # Track device for each model for multi-GPU support
+        self.mimi_device = mimi_device if mimi_device is not None else device
+        self.other_mimi_device = other_mimi_device if other_mimi_device is not None else device
+        self.lm_device = lm_device if lm_device is not None else device
         self.voice_prompt_dir = voice_prompt_dir
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
                             sample_rate=self.mimi.sample_rate,
-                            device=device,
+                            device=self.lm_device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
         )
@@ -118,18 +159,36 @@ class ServerState:
     
     def warmup(self):
         for _ in range(4):
-            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+            # Use mimi_device for input chunk since mimi will encode it
+            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.mimi_device)
             codes = self.mimi.encode(chunk)
-            _ = self.other_mimi.encode(chunk)
+            # Move codes to other_mimi device if needed
+            if self.other_mimi_device != self.mimi_device:
+                codes_other = codes.to(self.other_mimi_device)
+            else:
+                codes_other = codes
+            _ = self.other_mimi.encode(codes_other if codes_other.device != self.other_mimi_device else chunk)
             for c in range(codes.shape[-1]):
-                tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                # Move codes to lm device for processing
+                codes_slice = codes[:, :, c: c + 1]
+                if codes_slice.device != self.lm_device:
+                    codes_slice = codes_slice.to(self.lm_device)
+                tokens = self.lm_gen.step(codes_slice)
                 if tokens is None:
                     continue
-                _ = self.mimi.decode(tokens[:, 1:9])
-                _ = self.other_mimi.decode(tokens[:, 1:9])
+                # Move tokens back to mimi/other_mimi devices for decoding
+                tokens_mimi = tokens[:, 1:9].to(self.mimi_device) if tokens.device != self.mimi_device else tokens[:, 1:9]
+                tokens_other = tokens[:, 1:9].to(self.other_mimi_device) if tokens.device != self.other_mimi_device else tokens[:, 1:9]
+                _ = self.mimi.decode(tokens_mimi)
+                _ = self.other_mimi.decode(tokens_other)
 
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
+        # Synchronize all CUDA devices
+        if self.mimi_device.type == 'cuda':
+            torch.cuda.synchronize(self.mimi_device)
+        if self.other_mimi_device.type == 'cuda' and self.other_mimi_device != self.mimi_device:
+            torch.cuda.synchronize(self.other_mimi_device)
+        if self.lm_device.type == 'cuda' and self.lm_device != self.mimi_device and self.lm_device != self.other_mimi_device:
+            torch.cuda.synchronize(self.lm_device)
 
 
     async def handle_chat(self, request):
@@ -220,16 +279,29 @@ class ServerState:
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
-                    chunk = chunk.to(device=self.device)[None, None]
-                    codes = self.mimi.encode(chunk)
-                    _ = self.other_mimi.encode(chunk)
+                    # Move chunk to mimi device for encoding
+                    chunk_mimi = chunk.to(device=self.mimi_device)[None, None]
+                    codes = self.mimi.encode(chunk_mimi)
+                    # Move chunk to other_mimi device if different
+                    if self.other_mimi_device != self.mimi_device:
+                        chunk_other = chunk.to(device=self.other_mimi_device)[None, None]
+                    else:
+                        chunk_other = chunk_mimi
+                    _ = self.other_mimi.encode(chunk_other)
                     for c in range(codes.shape[-1]):
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        # Move codes slice to lm device
+                        codes_slice = codes[:, :, c: c + 1]
+                        if codes_slice.device != self.lm_device:
+                            codes_slice = codes_slice.to(self.lm_device)
+                        tokens = self.lm_gen.step(codes_slice)
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-                        main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
+                        # Move tokens to mimi/other_mimi devices for decoding
+                        tokens_mimi = tokens[:, 1:9].to(self.mimi_device) if tokens.device != self.mimi_device else tokens[:, 1:9]
+                        tokens_other = tokens[:, 1:9].to(self.other_mimi_device) if tokens.device != self.other_mimi_device else tokens[:, 1:9]
+                        main_pcm = self.mimi.decode(tokens_mimi)
+                        _ = self.other_mimi.decode(tokens_other)
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
@@ -373,6 +445,9 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Automatically distribute models across available GPUs. "
+                             "With 4 GPUs: mimi on GPU 0, other_mimi on GPU 1, lm on GPUs 2-3.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -407,6 +482,39 @@ def main():
     logger.info(f"static_path = {static_path}")
     args.device = torch_auto_device(args.device)
 
+    # Detect and distribute GPUs if multi-GPU is enabled
+    use_multi_gpu_lm = False
+    mimi_device = args.device
+    other_mimi_device = args.device
+    lm_device = args.device
+    
+    if args.multi_gpu or (args.device.type == "cuda" and torch.cuda.device_count() > 1):
+        available_gpus = get_available_gpus()
+        num_gpus = len(available_gpus)
+        logger.info(f"Multi-GPU mode: {num_gpus} GPUs detected")
+        
+        if num_gpus >= 4:
+            # Optimal distribution for 4+ GPUs
+            mimi_device = available_gpus[0]
+            other_mimi_device = available_gpus[1]
+            lm_device = available_gpus[2]  # Primary device for LM, will be split across 2-3
+            use_multi_gpu_lm = True
+            logger.info(f"Model distribution: mimi -> {mimi_device}, other_mimi -> {other_mimi_device}, lm -> GPUs 2-3")
+        elif num_gpus == 3:
+            mimi_device = available_gpus[0]
+            other_mimi_device = available_gpus[1]
+            lm_device = available_gpus[2]
+            logger.info(f"Model distribution: mimi -> {mimi_device}, other_mimi -> {other_mimi_device}, lm -> {lm_device}")
+        elif num_gpus == 2:
+            mimi_device = available_gpus[0]
+            other_mimi_device = available_gpus[1]
+            lm_device = available_gpus[1]
+            logger.info(f"Model distribution: mimi -> {mimi_device}, other_mimi -> {lm_device}, lm -> {lm_device}")
+        else:
+            logger.info(f"Single GPU mode: all models on {available_gpus[0]}")
+    else:
+        logger.info(f"Single device mode: all models on {args.device}")
+
     seed_all(42424242)
 
     setup_tunnel = None
@@ -431,9 +539,9 @@ def main():
     logger.info("loading mimi")
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
-    mimi = loaders.get_mimi(args.mimi_weight, args.device)
-    other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
-    logger.info("mimi loaded")
+    mimi = loaders.get_mimi(args.mimi_weight, mimi_device)
+    other_mimi = loaders.get_mimi(args.mimi_weight, other_mimi_device)
+    logger.info(f"mimi loaded on {mimi_device}, other_mimi loaded on {other_mimi_device}")
 
     if args.tokenizer is None:
         args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
@@ -442,17 +550,50 @@ def main():
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+    
+    # For multi-GPU LM distribution, use accelerate if available
+    if use_multi_gpu_lm and not args.cpu_offload:
+        try:
+            from accelerate import infer_auto_device_map, dispatch_model
+            # Load LM on CPU first, then distribute
+            lm = loaders.get_moshi_lm(args.moshi_weight, device="cpu", cpu_offload=False)
+            # Create device map for GPUs 2 and 3 (assuming 4 GPUs)
+            available_gpus = get_available_gpus()
+            if len(available_gpus) >= 4:
+                # Create max_memory dict for GPUs 2 and 3
+                max_memory = {2: "14GiB", 3: "14GiB"}  # Tesla T4 has ~14GB
+                device_map = infer_auto_device_map(
+                    lm,
+                    max_memory=max_memory,
+                    no_split_module_classes=["StreamingTransformerLayer"],
+                    dtype=torch.bfloat16,
+                )
+                lm = dispatch_model(lm, device_map=device_map)
+                logger.info(f"LM model distributed across GPUs 2-3 using device_map")
+                # For dispatched models, use the first GPU in device_map as the primary device
+                # This is needed for LMGen initialization
+                lm_device = available_gpus[2]  # Keep as primary device for tensor operations
+            else:
+                lm = lm.to(lm_device)
+        except ImportError:
+            logger.warning("accelerate not available for multi-GPU LM, using single GPU")
+            lm = loaders.get_moshi_lm(args.moshi_weight, device=lm_device, cpu_offload=args.cpu_offload)
+    else:
+        lm = loaders.get_moshi_lm(args.moshi_weight, device=lm_device, cpu_offload=args.cpu_offload)
+    
     lm.eval()
-    logger.info("moshi loaded")
+    logger.info(f"moshi loaded on {lm_device}")
     state = ServerState(
         mimi=mimi,
         other_mimi=other_mimi,
         text_tokenizer=text_tokenizer,
         lm=lm,
-        device=args.device,
+        device=args.device,  # Keep for backward compatibility
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        mimi_device=mimi_device,
+        other_mimi_device=other_mimi_device,
+        lm_device=lm_device,
     )
     logger.info("warming up the model")
     state.warmup()
