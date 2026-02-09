@@ -560,14 +560,14 @@ def main():
             # Create device map for all available GPUs
             available_gpus = get_available_gpus()
             if len(available_gpus) >= 4:
-                # Tesla T4 has ~16GB total VRAM
-                # Reserve ~1-2GB for mimi/other_mimi on GPUs 0-1, use rest for LM
-                # Use higher limits to utilize more VRAM - accelerate will be conservative by default
+                # Tesla T4 has ~16GB total VRAM.
+                # Keep GPU 0/1 for mimi/other_mimi only to avoid OOM during dispatch.
+                # LM shards are limited to GPUs 2-3.
                 max_memory = {
-                    0: "15GiB",  # Reserve ~1GB for mimi
-                    1: "15GiB",  # Reserve ~1GB for other_mimi  
-                    2: "16GiB",  # Use nearly all VRAM for LM
-                    3: "16GiB",  # Use nearly all VRAM for LM
+                    0: "0GiB",   # Exclude from LM placement
+                    1: "0GiB",   # Exclude from LM placement
+                    2: "15.5GiB",
+                    3: "15.5GiB",
                 }
                 device_map = infer_auto_device_map(
                     lm,
